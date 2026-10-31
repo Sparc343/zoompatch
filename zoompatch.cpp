@@ -1,6 +1,13 @@
 // zoompatch.cpp - find the camera zoom-clamp "jbe short" in elementclient exe and flip it to "jmp short".
 //
-// Build (w64devkit):   g++ -O2 -std=c++17 -static -o zoompatch.exe zoompatch.cpp
+// Build (w64devkit), with the embedded manifest (see zoompatch.manifest / zoompatch.rc):
+//   windres zoompatch.rc -O coff -o zoompatch_res.o
+//   g++ -O2 -std=c++17 -static -o zoompatch.exe zoompatch.cpp zoompatch_res.o
+//
+// UAC: the manifest says "asInvoker", so Windows never auto-elevates this exe (without it, the
+// name "...patch..." triggers installer detection and the usage text vanishes into a new window).
+// Dry runs never need admin. If --apply/--revert can't write (e.g. game in Program Files), the
+// tool relaunches itself elevated at that point, waits for it, and returns its exit code.
 //
 // Usage:
 //   zoompatch.exe <exe>            dry run: report what would change
@@ -16,6 +23,7 @@
 //   jbe short (76 rel8)    <-- patch site, 0x76 -> 0xEB
 // Exactly one candidate must match, otherwise nothing is touched.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -23,7 +31,42 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#endif
+
 using Bytes = std::vector<uint8_t>;
+
+#ifdef _WIN32
+// Re-run this exe elevated ("runas") with the same arguments plus --elevated, wait for it, and
+// pass back its exit code. Returns false if the user declined UAC or the launch failed.
+static bool relaunchElevated(int argc, char** argv, int& exitCode) {
+    std::string params;
+    for (int i = 1; i < argc; i++) {
+        if (!std::strcmp(argv[i], "--elevated")) continue;
+        params += "\"" + std::string(argv[i]) + "\" ";
+    }
+    params += "--elevated";
+    char exe[MAX_PATH], cwd[MAX_PATH];
+    if (!GetModuleFileNameA(nullptr, exe, MAX_PATH) || !GetCurrentDirectoryA(MAX_PATH, cwd)) return false;
+    SHELLEXECUTEINFOA sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    sei.lpVerb = "runas";
+    sei.lpFile = exe;
+    sei.lpParameters = params.c_str();
+    sei.lpDirectory = cwd; // so a relative <exe> path still resolves in the elevated copy
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExA(&sei) || !sei.hProcess) return false;
+    WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(sei.hProcess, &code);
+    CloseHandle(sei.hProcess);
+    exitCode = (int)code;
+    return true;
+}
+#endif
 
 static uint16_t rd16(const Bytes& b, size_t o) { return b[o] | (b[o + 1] << 8); }
 static uint32_t rd32(const Bytes& b, size_t o) { return rd16(b, o) | ((uint32_t)rd16(b, o + 2) << 16); }
@@ -49,7 +92,7 @@ static bool hasLoad(const Bytes& d, size_t lo, size_t hi, uint8_t disp, bool x64
 
 struct Hit { size_t fileOff; uint64_t va; uint8_t cur; };
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv, bool elevated) {
     if (argc < 2) { std::puts("usage: zoompatch <exe> [--apply|--revert]"); return 2; }
     std::string path = argv[1];
     bool apply = false, revert = false;
@@ -57,6 +100,7 @@ int main(int argc, char** argv) {
         if (!std::strcmp(argv[i], "--apply")) apply = true;
         else if (!std::strcmp(argv[i], "--revert")) revert = true;
     }
+    (void)elevated;
 
     std::ifstream in(path, std::ios::binary);
     if (!in) { std::printf("cannot open %s\n", path.c_str()); return 1; }
@@ -123,21 +167,50 @@ int main(int argc, char** argv) {
     if (!apply && !revert) { std::printf("dry run: would change %02X -> %02X (use --apply)\n", h.cur, want); return 0; }
     if (h.cur == want) { std::puts("already in the requested state"); return 0; }
 
+    // Anything that fails here with "denied" (read-only dir/file) is the cue to elevate - before
+    // anything has been modified.
+    auto needElevation = [&](const char* why) -> int {
+#ifdef _WIN32
+        if (!elevated) {
+            std::printf("%s - requesting administrator rights...\n", why);
+            int code = 1;
+            if (relaunchElevated(argc, argv, code)) return code;
+            std::puts("elevation was declined or failed - nothing changed");
+            return 1;
+        }
+#endif
+        std::printf("%s\n", why);
+        return 1;
+    };
+
     if (!revert) {
         std::ifstream chk(path + ".bak", std::ios::binary);
         if (!chk) {
             std::ofstream bak(path + ".bak", std::ios::binary);
             bak.write((const char*)d.data(), d.size());
-            if (!bak) { std::puts("could not write backup - aborting"); return 1; }
+            bak.flush();
+            if (!bak) return needElevation("cannot create backup next to the exe");
             std::puts("backup written: .bak");
         }
     }
     std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
-    if (!f) { std::puts("cannot open for writing (is the game running?)"); return 1; }
+    if (!f) return needElevation("cannot open the exe for writing (is the game running? is it in a protected folder?)");
     f.seekp((std::streamoff)h.fileOff);
     f.put((char)want);
     f.flush();
     if (!f) { std::puts("write failed"); return 1; }
     std::printf("patched: %02X -> %02X at file offset 0x%zX\n", h.cur, want, h.fileOff);
     return 0;
+}
+
+int main(int argc, char** argv) {
+    bool elevated = false;
+    for (int i = 1; i < argc; i++)
+        if (!std::strcmp(argv[i], "--elevated")) elevated = true;
+    int rc = run(argc, argv, elevated);
+    if (elevated) { // the elevated copy has its own console window that would vanish instantly
+        std::puts("\nPress Enter to close...");
+        std::getchar();
+    }
+    return rc;
 }
